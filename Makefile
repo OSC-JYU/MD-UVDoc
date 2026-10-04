@@ -1,33 +1,25 @@
-IMAGES := $(shell docker images -f "dangling=true" -q)
-CONTAINERS := $(shell docker ps -a -q -f status=exited)
-VOLUME := md-uvdoc
-VERSION := 0.1
-REPOSITORY := local
+CONTAINER_RUNTIME ?= podman
+VERSION := 0.2
+REPOSITORY := localhost/messydesk
 IMAGE := md-uvdoc
-
-ifneq (,$(wildcard .env))
-    include .env
-    export
-endif
-
-clean:
-	docker rm -f $(CONTAINERS)
-	docker rmi -f $(IMAGES)
+LOCAL_IMAGE := $(REPOSITORY)/$(IMAGE):$(VERSION)
 
 build:
-	docker build -t $(REPOSITORY)/messydesk/$(IMAGE):$(VERSION) .
+	$(CONTAINER_RUNTIME) build -t $(LOCAL_IMAGE) .
 
 start:
-	docker run -d --name $(IMAGE) \
-		-p 9006:9006 \
-		--restart unless-stopped \
-		$(REPOSITORY)/messydesk/$(IMAGE):$(VERSION)
+	$(CONTAINER_RUNTIME) run -d --name $(IMAGE) -p 9006:9006 --restart unless-stopped $(LOCAL_IMAGE)
 
-restart:
-	docker stop $(IMAGE)
-	docker rm $(IMAGE)
-	$(MAKE) start
+stop:
+	-$(CONTAINER_RUNTIME) stop $(IMAGE)
+	-$(CONTAINER_RUNTIME) rm $(IMAGE)
+
+restart: stop start
 
 bash:
-	docker exec -it $(IMAGE) bash
+	$(CONTAINER_RUNTIME) exec -it $(IMAGE) bash
 
+# The tests run in the service image (tests/ and test/ are not copied into it).
+test: build
+	$(CONTAINER_RUNTIME) run --rm -e HOME=/tmp -e PYTHONUSERBASE=/tmp/pyuser -v $(CURDIR)/tests:/app/tests:ro,Z -v $(CURDIR)/test:/app/test:ro,Z -v $(CURDIR)/model:/app/model:ro,Z $(LOCAL_IMAGE) \
+		sh -c "pip install -q --user pytest httpx pillow && python -m pytest -q -p no:cacheprovider tests"

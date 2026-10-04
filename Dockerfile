@@ -1,23 +1,24 @@
-# Use Python 3.9 as base image
-FROM python:3.9-slim
+FROM python:3.12-slim
 
-# Set working directory
+ENV PYTHONDONTWRITEBYTECODE=1 \
+    PYTHONUNBUFFERED=1 \
+    PORT=9006
+
 WORKDIR /app
 
-# Create data directory for mounting
-RUN mkdir -p /app/data
-
-# Copy requirements file
+# The CPU build of torch keeps the image small; UVDoc runs fine on CPU.
 COPY requirements.txt .
+RUN pip install --no-cache-dir --index-url https://download.pytorch.org/whl/cpu torch \
+ && pip install --no-cache-dir -r requirements.txt
 
-# Install dependencies
-RUN pip install --no-cache-dir --upgrade -r requirements.txt && apt-get clean && rm -rf /var/lib/apt/lists/*
+COPY api.py utils.py model.py md_storage.py md_service.py service.json ./
+COPY model/best_model.pkl ./model/best_model.pkl
+COPY help/index.md ./help/index.md
 
-# Copy the application code
-COPY . /app
+# uploads/ and output/ belong to the user the service runs as (uid 1000, as in the compose stack)
+RUN mkdir -p uploads output && chown -R 1000:1000 /app
+USER 1000
 
-# Expose the port the app runs on
 EXPOSE 9006
 
-# Command to run the application
-CMD ["python", "api.py"] 
+CMD ["python", "api.py"]

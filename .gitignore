@@ -134,3 +134,6 @@ data/doc3D/*
 data/DocUNet/*
 data/UVDoc/*
 data/UVDoc_benchmark/*
+# MessyDesk service
+uploads/
+output/

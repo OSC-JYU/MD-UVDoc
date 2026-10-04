@@ -1,137 +1,159 @@
-from fastapi import FastAPI, UploadFile, File, HTTPException, BackgroundTasks
-from fastapi.responses import FileResponse, JSONResponse
-from fastapi.middleware.cors import CORSMiddleware
-import os
-import uuid
+"""MessyDesk API for UVDoc (https://github.com/tanguymagne/UVDoc): dewarps photographed document
+pages, removing perspective and page curl.
+
+POST /process takes a `message` (task `dewarp`) and, in HTTP mode, the image as `content`; in disk
+mode the image is read from message.file.path (see md_storage.py). /config, /help and /health come
+from md_service.py.
+"""
 import json
+import os
+import threading
+import uuid
+from typing import Optional
+
 import cv2
 import numpy as np
 import torch
+from fastapi import BackgroundTasks, FastAPI, File, HTTPException, UploadFile
+from fastapi.concurrency import run_in_threadpool
+from fastapi.responses import FileResponse
 
+import md_service
+import md_storage
 from utils import IMG_SIZE, bilinear_unwarping, load_model
 
-from pydantic import BaseModel
+app = FastAPI(title="MD-UVDoc", description="UVDoc document unwarping for MessyDesk")
+
+UPLOAD_FOLDER = "uploads"
+OUTPUT_FOLDER = "output"
+os.makedirs(UPLOAD_FOLDER, exist_ok=True)
+os.makedirs(OUTPUT_FOLDER, exist_ok=True)
+
+CKPT_PATH = os.getenv("UVDOC_MODEL", "./model/best_model.pkl")
+device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
+_model = None
+_model_lock = threading.Lock()
 
 
-app = FastAPI(
-    title="UVDoc API",
-    description="API for UVDoc",
-    version="1.0.0"
-)
+def get_model():
+    """The model, loaded on first use so that /health and /config answer at once."""
+    global _model
+    with _model_lock:
+        if _model is None:
+            print(f"loading model {CKPT_PATH} on {device}")
+            model = load_model(CKPT_PATH, device)
+            model.to(device)
+            model.eval()
+            _model = model
+    return _model
 
-# Add CORS middleware
-app.add_middleware(
-    CORSMiddleware,
-    allow_origins=["*"],  # Allows all origins
-    allow_credentials=True,
-    allow_methods=["*"],  # Allows all methods
-    allow_headers=["*"],  # Allows all headers
-)
 
-UPLOAD_FOLDER = 'uploads'
-if not os.path.exists(UPLOAD_FOLDER):
-    os.makedirs(UPLOAD_FOLDER)
-
-OUTPUT_FOLDER = 'output'
-if not os.path.exists(OUTPUT_FOLDER):
-    os.makedirs(OUTPUT_FOLDER)
-
-def unwarp_img(img_path):
-    """
-    Unwarp a document image using the model from ckpt_path.
-    """
-
-    # Load image
+def unwarp_img(img_path: str) -> np.ndarray:
+    """The dewarped image (BGR) of a document photo."""
     img = cv2.imread(img_path)
+    if img is None:
+        raise HTTPException(status_code=400, detail="The input is not an image OpenCV can read")
     img = cv2.cvtColor(img, cv2.COLOR_BGR2RGB).astype(np.float32) / 255
-    inp = torch.from_numpy(cv2.resize(img, IMG_SIZE).transpose(2, 0, 1)).unsqueeze(0)
+    inp = torch.from_numpy(cv2.resize(img, IMG_SIZE).transpose(2, 0, 1)).unsqueeze(0).to(device)
+    with torch.no_grad():
+        point_positions2D, _ = get_model()(inp)
+        size = img.shape[:2][::-1]
+        unwarped = bilinear_unwarping(
+            warped_img=torch.from_numpy(img.transpose(2, 0, 1)).unsqueeze(0).to(device),
+            point_positions=torch.unsqueeze(point_positions2D[0], dim=0),
+            img_size=tuple(size),
+        )
+    unwarped = (unwarped[0].cpu().numpy().transpose(1, 2, 0) * 255).astype(np.uint8)
+    return cv2.cvtColor(unwarped, cv2.COLOR_RGB2BGR)
 
-    # Make prediction
-    inp = inp.to(device)
-    point_positions2D, _ = model(inp)
 
-    # Unwarp
-    size = img.shape[:2][::-1]
-    unwarped = bilinear_unwarping(
-        warped_img=torch.from_numpy(img.transpose(2, 0, 1)).unsqueeze(0).to(device),
-        point_positions=torch.unsqueeze(point_positions2D[0], dim=0),
-        img_size=tuple(size),
-    )
-    unwarped = (unwarped[0].detach().cpu().numpy().transpose(1, 2, 0) * 255).astype(np.uint8)
+def output_extension(name: str) -> str:
+    """PNG stays PNG (lossless); other images become JPEG."""
+    return "png" if str(name or "").lower().endswith(".png") else "jpg"
 
-    # Save result
-    unwarped_BGR = cv2.cvtColor(unwarped, cv2.COLOR_RGB2BGR)
-    return unwarped_BGR
 
+def dewarp(image_path: str, output_path: str) -> None:
+    if not cv2.imwrite(output_path, unwarp_img(image_path)):
+        raise RuntimeError(f"could not write {output_path}")
 
 
 @app.get("/")
 async def root():
     return {"message": "UVDoc API for MessyDesk"}
 
+
 @app.post("/process")
 async def process_files(
-    request: UploadFile = File(...),
-    content: UploadFile = File(...)
+    message: Optional[UploadFile] = File(None),
+    # MessyDesk sends the task as "message"; "request" is the old name, still accepted
+    request: Optional[UploadFile] = File(None),
+    content: Optional[UploadFile] = File(None),
 ):
+    message = message or request
+    if message is None:
+        raise HTTPException(status_code=400, detail="message is required")
     try:
-        print("Processing files...")
-        # Start execution time counter
-        import time
-        start_time = time.time()
+        msg = json.loads((await message.read()).decode("utf-8"))
+        if isinstance(msg, str):
+            msg = json.loads(msg)
+    except (UnicodeDecodeError, json.JSONDecodeError) as e:
+        raise HTTPException(status_code=400, detail=f"Invalid message: {e}")
+    task_id = (msg.get("task") or {}).get("id")
+    if task_id != "dewarp":
+        raise HTTPException(status_code=400, detail=f"Unsupported task: {task_id}")
 
-        # read request as JSON
-        request_data = await request.read()
-        request_json = json.loads(request_data.decode('utf-8'))
-        print(request_json)
-
-        # save content to file with UUID 
-        fileuuid = str(uuid.uuid4())
-        content_path = os.path.join(UPLOAD_FOLDER, fileuuid)
-        with open(content_path, 'wb') as f:
-            f.write(await content.read())
-
-        f = unwarp_img(content_path)
-        cv2.imwrite(os.path.join(OUTPUT_FOLDER, fileuuid + ".jpg"), f)
-        # delete content file
-        os.remove(content_path)
-
-        # End execution time counter
-        end_time = time.time()
-        return {"execution_time": round(end_time - start_time, 1), "response": {"uri": '/files/' + fileuuid + ".jpg"}}
-        
+    output_id = uuid.uuid4().hex
+    upload_path = None
+    try:
+        if content is not None:
+            extension = output_extension(content.filename)
+            upload_path = os.path.join(UPLOAD_FOLDER, output_id + os.path.splitext(content.filename or "")[1])
+            with open(upload_path, "wb") as f:
+                f.write(await content.read())
+            image_path = upload_path
+        else:
+            image_path = str(md_storage.message_input_path(msg))
+            extension = output_extension(image_path)
+        output_path = os.path.join(OUTPUT_FOLDER, f"{output_id}.{extension}")
+        # the model is CPU/GPU-bound - keep it off the event loop
+        await run_in_threadpool(dewarp, image_path, output_path)
+    except md_storage.StorageError as e:
+        raise HTTPException(status_code=400, detail=str(e))
+    except HTTPException:
+        raise
     except Exception as e:
-        print(e)
-        raise HTTPException(
-            status_code=500,
-            detail=f"Processing failed: {str(e)}"
-        )
+        raise HTTPException(status_code=500, detail=f"Processing failed: {e}")
+    finally:
+        if upload_path:
+            try:
+                os.remove(upload_path)
+            except OSError:
+                pass
+
+    # <source label>.<ext>, an image, as the elg adapter names a single HTTP output
+    if content is None:
+        entry = md_storage.stage_output(msg, output_path, f"{md_storage.source_label(msg)}.{extension}", "image", extension)
+        return md_storage.disk_response([entry])
+    return {"response": {"type": "stored", "uri": f"/files/{output_id}.{extension}"}}
+
 
 @app.get("/files/{filename}")
-async def serve_file(filename: str, background_tasks: BackgroundTasks):
-    file_path = os.path.join(OUTPUT_FOLDER, filename)
-    if not os.path.isfile(file_path):
-        raise HTTPException(
-            status_code=404,
-            detail="File not found"
-        )
-    def remove_file(path: str):
-        try:
-            os.remove(path)
-        except Exception as e:
-            print(f"Error deleting file {path}: {e}")
-            
-    background_tasks.add_task(remove_file, file_path)
-    return FileResponse(file_path, background=background_tasks)
+def serve_file(filename: str, background_tasks: BackgroundTasks):
+    output_dir = os.path.realpath(OUTPUT_FOLDER)
+    file_path = os.path.realpath(os.path.join(output_dir, filename))
+    # only files directly in OUTPUT_FOLDER; '../' paths could read any file
+    if os.path.dirname(file_path) != output_dir or not os.path.isfile(file_path):
+        raise HTTPException(status_code=404, detail="File not found")
+    background_tasks.add_task(os.remove, file_path)
+    return FileResponse(file_path)
+
+
+# /config (service.json with the adapter of the storage mode), /help (help/index.md), /health
+md_service.add_routes(app)
 
 
 if __name__ == "__main__":
-    ckpt_path = './model/best_model.pkl'
-    device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
-    print(device)
-    print('loading model ', ckpt_path)
-    model = load_model(ckpt_path, device)
-    model.to(device)
-    model.eval()
     import uvicorn
-    uvicorn.run(app, host="0.0.0.0", port=9006) 
+
+    print(f"storage mode: {md_storage.describe_mode()}")
+    uvicorn.run(app, host="0.0.0.0", port=int(os.getenv("PORT", "9006")))

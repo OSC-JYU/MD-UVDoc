@@ -1,0 +1,26 @@
+{
+    "id": "md-uvdoc",
+    "name": "UVDoc",
+    "adapter": "elg",
+    "category": "preparation",
+    "status": "experimental",
+    "local_url": "http://localhost:9006",
+    "source_url": "https://github.com/tanguymagne/UVDoc",
+    "description": "Flattens photographed document pages: removes perspective and page curl with the UVDoc neural grid-based unwarping model, so that OCR gets a straight, flat page.",
+    "supported_types": [
+        "image"
+    ],
+    "supported_formats": [
+        "png",
+        "jpg",
+        "jpeg"
+    ],
+    "tasks": {
+        "dewarp": {
+            "name": "Dewarp image",
+            "description": "Removes perspective and page curl from a photographed page. Writes the flattened page as an image (PNG stays PNG, other images become JPEG).",
+            "info": "I tried to dewarp an image",
+            "behaviour": "one-to-one"
+        }
+    }
+}
