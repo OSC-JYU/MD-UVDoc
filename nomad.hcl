@@ -1,7 +1,7 @@
 job "md-uvdoc" {
   type = "service"
 
-  group "MD-bertopic" {
+  group "MD-UVDoc" {
     count = 1
 
     restart {
